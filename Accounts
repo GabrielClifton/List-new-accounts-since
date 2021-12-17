@@ -1,0 +1,148 @@
+clear-host
+
+$startdate = (Get-Date 06-01).toString("MM-dd")
+$today     = Get-Date -format MM-dd
+
+if($today -eq $startdate){
+    #Get school year formatting for file
+    $year = Get-Date -format yyyy
+    $prevyear = $year -1
+    $fileyear = "$prevyear - $year"
+
+    #Copy data from prior school years file to a new file labled with prior school year as name
+    gam user <GAM Account> copy drivefile <Google Sheet ID> newfilename $fileyear parentid <Google folder ID>
+    #Clear GAM used Sheet tabs to start from scratch
+    gam user <GAM Account> clear sheetrange <Google Sheet ID> rangelist "New Accounts Working Sheet","Disabled Accounts Working Sheet","Deleted Accounts Working Sheet","New Google Accounts Working Sheet","Disabled Google Accounts Working Sheet","Deleted Google Accounts Working Sheet"
+}
+
+#Get timeframe
+$startdate = Get-Date $startdate
+$start = if((Get-Date).ToString("MM") -lt 06){$startdate.AddYears(-1)}else{$startdate}
+
+#Active Directory when created search
+Get-ADUser -Filter 'enabled -eq $true' -Properties whenCreated | Where {$_.whenCreated -gt $start} | select SamAccountName, whenCreated,@{n='OU';e={$_.DistinguishedName.Split(',')[1].replace('OU=','')}} | Sort-Object -property whenCreated -Descending | export-csv $env:TEMP\ADUsers.csv -NoTypeInformation
+gam user <GAM Account> update drivefile id "<Google Sheet ID>" newfilename "FSISD Accounts" localfile $env:TEMP\ADUsers.csv csvsheet id:766654975
+
+#Active Directory when modified search - disabled, deleted
+$users = @()
+$OU1 = 'OU=Student,DC=fsisd,DC=local'
+$OU2 = 'OU=Inactive Users,DC=fsisd,DC=local'
+$usersCreatedSinceStart  = Get-ADUser -Searchbase $OU1 -Filter {whenChanged -gt $start} -Properties WhenChanged
+$usersCreatedSinceStart += Get-ADUser -SearchBase $OU2 -Filter {whenChanged -gt $start} -Properties WhenChanged
+
+#2
+Get-ADUser -Filter 'enabled -eq $false' -Properties whenCreated | Where {$_.whenCreated -gt $start} | select SamAccountName, whenCreated,@{n='OU';e={$_.DistinguishedName.Split(',')[1].replace('OU=','')}} | Sort-Object -property whenCreated -Descending | export-csv $env:TEMP\DisabledADUsers.csv -NoTypeInformation
+
+gam user <GAM Account> update drivefile id "<Google Sheet ID>" newfilename "FSISD Accounts" localfile $env:TEMP\DisabledADUsers.csv csvsheet id:358260266
+
+#3
+Get-ADObject -Filter 'whenChanged -gt $start -and isDeleted -eq $True -and -not (isRecycled -eq $True) -and name -ne "Deleted Objects" -and objectClass -eq "user"' -IncludeDeletedObjects -Properties whenChanged, samaccountname, LastKnownParent|
+select SamAccountName, whenChanged, LastKnownParent | Sort whenChanged -Descending |
+export-csv $env:TEMP\DeletedADUsers.csv -NoTypeInformation
+
+import-csv $env:TEMP\DeletedADUsers.csv | Where SamAccountName -notlike '*`$*' | export-csv $env:TEMP\DeletedADUsers2.csv -NoTypeInformation
+
+gam user <GAM Account> update drivefile id "<Google Sheet ID>" newfilename "FSISD Accounts" localfile $env:TEMP\DeletedADUsers2.csv csvsheet id:236137069
+
+
+#Grab current Google data
+gam print users issuspended false fields primaryemail,ou,creationtime >$env:Temp\Google_Active.csv
+gam print users issuspended true fields primaryemail,ou,creationtime >$env:Temp\Google_Disabled.csv
+gam print users deletedonly deletionTime >$env:Temp\Google_Deleted.csv
+
+#format Active
+$csv = import-csv "$env:Temp\Google_Active.csv"
+$data = 
+foreach($row in $CSV){
+    [pscustomobject]@{
+        primaryEmail = $row.primaryEmail.Split("@")[0]
+        orgUnitPath  = $row.orgUnitPath
+        creationTime = $row.creationTime.Split("T")[0]
+    }
+}
+
+$data | export-csv "$env:Temp\Google_Active2.csv" -NoTypeInformation
+
+#Take Google account CSV and remove any accounts that have an AD account.
+$ADCsv = Import-Csv "$env:Temp\ADUsers.csv" -Header "SamAccountName","whenCreated","OU"
+$GoogleCsv = Import-Csv "$env:Temp\Google_Active2.csv" -Header "primaryEmail","orgUnitPath","creationTime"
+$GoogleCsv | Where {$ADCsv.SamAccountName -notcontains $_.primaryEmail} | Export-Csv "$env:Temp\Google_Active.csv" -NoTypeInformation -Force
+
+Import-Csv $env:Temp\Google_Active.csv | Select -Skip 3 | % {$_.creationTime = ([datetime]($_.creationTime)).ToString('MM/dd/yyyy');$_} | Export-Csv $env:Temp\Google_Active2.csv -NoTypeInformation
+
+Import-Csv $env:Temp\Google_Active2.csv |
+ Where-Object {$_.creationTime -as [datetime] -gt $start} |
+   Export-Csv -Path $env:Temp\Google_Active3.csv -NoTypeInformation
+
+Import-Csv $env:Temp\Google_Active3.csv | Select -Skip 3 | % {$_.creationTime = ([datetime]($_.creationTime)).ToString('MM/dd/yyyy');$_} | Export-Csv $env:Temp\Google_Active2.csv -NoTypeInformation
+
+$prop1 = @{Expression={[DateTime]$_.creationTime}; Descending=$true }
+$prop2 = @{Expression='primaryEmail'; Ascending=$true }
+(Import-Csv $env:TEMP\Google_Active3.csv) |
+    Sort-Object $prop1, $prop2 |
+    Export-Csv $env:TEMP\Google_Active3.csv -NoType
+
+#Format Disabled
+$csv = import-csv "$env:Temp\Google_Disabled.csv"
+$data = 
+foreach($row in $CSV){
+    [pscustomobject]@{
+        primaryEmail = $row.primaryEmail.Split("@")[0]
+        orgUnitPath  = $row.orgUnitPath
+        creationTime = $row.creationTime.Split("T")[0]
+    }
+}
+
+$data | export-csv "$env:Temp\Google_Disabled.csv" -NoTypeInformation
+
+Import-Csv $env:Temp\Google_Disabled.csv | % {$_.creationTime = ([datetime]($_.creationTime)).ToString('MM/dd/yyyy');$_} | Export-Csv $env:Temp\Google_Disabled2.csv -NoTypeInformation
+
+$prop1 = @{Expression={[DateTime]$_.creationTime}; Descending=$true }
+$prop2 = @{Expression='primaryEmail'; Ascending=$true }
+(Import-Csv $env:TEMP\Google_Disabled2.csv) |
+    Sort-Object $prop1, $prop2 |
+    Export-Csv $env:TEMP\Google_Disabled2.csv -NoType
+
+#Format Deleted
+$csv = import-csv "$env:Temp\Google_Deleted.csv"
+$data = 
+foreach($row in $CSV){
+    [pscustomobject]@{
+        primaryEmail = $row.primaryEmail.Split("@")[0]
+        orgUnitPath  = $row.orgUnitPath
+        creationTime = $row.creationTime.Split("T")[0]
+    }
+}
+
+$data | export-csv "$env:Temp\Google_Deleted.csv" -NoTypeInformation
+
+Import-Csv $env:Temp\Google_Deleted.csv | % {$_.creationTime = ([datetime]($_.creationTime)).ToString('MM/dd/yyyy');$_} | Export-Csv $env:Temp\Google_Deleted2.csv -NoTypeInformation
+
+$prop1 = @{Expression={[DateTime]$_.creationTime}; Descending=$true }
+$prop2 = @{Expression='primaryEmail'; Ascending=$true }
+(Import-Csv $env:TEMP\Google_Deleted2.csv) |
+    Sort-Object $prop1, $prop2 |
+    Export-Csv $env:TEMP\Google_Deleted2.csv -NoType
+
+#All Google Accounts
+gam print users domain fsisd.net fields familyName,givenName,primaryEmail,ou,creationtime,isEnrolledIn2Sv,lastLoginTime licenses issuspended false queries "\"orgUnitPath='/Alamo/Alamo Principals'\"","\"orgUnitPath='/Alamo/Alamo Staff'\"","\"orgUnitPath='/Alamo/Alamo Staff/Counselor'\"","\"orgUnitPath='/Alamo/Alamo Teachers'\"","\"orgUnitPath='/Apache/Apache Principals'\"","\"orgUnitPath='/Apache/Apache Staff'\"","\"orgUnitPath='/Apache/Apache Teachers'\"","\"orgUnitPath='/Butz/Butz Principals'\"","\"orgUnitPath='/Butz/Butz Staff'\"","\"orgUnitPath='/Central Office/Central Office Staff'\"","\"orgUnitPath='/Custodian'\"","\"orgUnitPath='/Food Services/Food Service Staff'\"","\"orgUnitPath='/HS/High School Principals'\"","\"orgUnitPath='/HS/High School Staff'\"","\"orgUnitPath='/HS/High School Teachers'\"","\"orgUnitPath='/Intermediate/Intermediate Principals'\"","\"orgUnitPath='/Intermediate/Intermediate Staff'\"","\"orgUnitPath='/Intermediate/Intermediate Teachers'\"","\"orgUnitPath='/MS/Middle School Principals'\"","\"orgUnitPath='/MS/Middle School Staff'\"","\"orgUnitPath='/MS/Middle School Teachers'\"","\"orgUnitPath='/Operations/Operations Staff'\"","\"orgUnitPath='/Special Services/Special Services Staff'\"","\"orgUnitPath='/Technology/Technology Admin'\"","\"orgUnitPath='/Technology/Technology Staff'\"">$env:TEMP\Google_Staff.csv
+gam print users domain student.fsisd.net fields familyName,givenName,primaryEmail,ou,creationtime,isEnrolledIn2Sv,lastLoginTime licenses issuspended false queries "\"orgUnitPath='/Alamo/Alamo Student'\"","\"orgUnitPath='/Apache/Apache Students'\"","\"orgUnitPath='/Intermediate/Intermediate Students'\"","\"orgUnitPath='/MS/Middle School Students'\"","\"orgUnitPath='/HS/High School Students'\"">$env:TEMP\Google_Student.csv
+
+
+#Upload to Google
+gam user fsisd.gam@fsisd.net update drivefile id "<Google Sheet ID>" newfilename "FSISD Accounts" localfile $env:TEMP\Google_Active3.csv csvsheet id:1632221574
+gam user fsisd.gam@fsisd.net update drivefile id "<Google Sheet ID>" newfilename "FSISD Accounts" localfile $env:TEMP\Google_Disabled2.csv csvsheet id:669127304
+gam user fsisd.gam@fsisd.net update drivefile id "<Google Sheet ID>" newfilename "FSISD Accounts" localfile $env:TEMP\Google_Deleted2.csv csvsheet id:390159779
+gam user fsisd.gam@fsisd.net update drivefile id "<Google Sheet ID>" newfilename "FSISD Accounts" localfile $env:TEMP\Google_Staff.csv csvsheet id:1901756248
+gam user fsisd.gam@fsisd.net update drivefile id "<Google Sheet ID>" newfilename "FSISD Accounts" localfile $env:TEMP\Google_Student.csv csvsheet id:1131842331
+
+Remove-Item $env:TEMP\ADUsers.csv
+
+Remove-Item $env:TEMP\DisabledADUsers.csv
+
+Remove-Item $env:TEMP\DeletedADUsers.csv
+Remove-Item $env:TEMP\DeletedADUsers2.csv
+
+Remove-Item $env:TEMP\Google_Active.csv
+Remove-Item $env:TEMP\Google_Disabled.csv
+Remove-Item $env:TEMP\Google_Deleted.csv
